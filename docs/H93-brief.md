@@ -287,3 +287,48 @@ create table items (   -- عناصر من مصادر غير المتاجر (redd
 3. هل نُبقي المصادقة الحالية (Cloudflare Access + token) أم ننتقل لـ Supabase Auth + PIN؟ التوصية: أبقِ الحالية — أبسط وأكثر أماناً لمستخدم واحد.
 4. المجال الأول (vertical) للـ 20–50 تطبيق: يُفضَّل مجال أنت مستخدم فيه، بعيد عن الصحة/البنوك. ترشيح vendor غير مؤكد: meditation، diet tracking، parenting.
 5. هل ننقل التحليل الحالي (per-app insights) ليصبح مشتقاً من الـ clusters بدل الـ labels الحرة؟ التوصية: نعم، بعد المرحلة 2.
+
+---
+
+## 18. نتيجة النقاش مع "مالك كود Storefront" (إيجنت قرأ الكود الفعلي) — قرارات معدَّلة
+
+### ما تغيّر في الخطة
+1. **ترتيب المراحل انقلب:** الـ embeddings/pgvector تأجلت للمرحلة 4 (فقط إذا ثبت أن تجميع الـ labels غير كافٍ). 30 تطبيق × أعلى labels ≈ 600 label منظَّم؛ دمج LLM ليلي واحد عبر المجال كافٍ لاختبار وجود فرص. الترتيب الجديد: (1) إثراء التصنيف + إعادة التحليل + dedupe متعدد الدول → (2) `opportunities`/`killed_ideas` + evidence view + أدوات MCP للقراءة → (3) حلقة النتائج (`own_app`, `record_outcome`) → (4) pgvector عند الحاجة → (5) مصادر جديدة.
+2. **الـ rubric يُعاد تصميمه:** 45/100 نقطة تعتمد على اسم منافس/سعر/إلغاء، وتقييمات المتاجر نادراً تذكر منافسين → توقّع `wtp_signal='none'` في ~90%. نحتفظ بالحقول كاستخراج (هي الـ moat) لكن الترتيب يُحسب بـ SQL من حقائق: عدد الـ listings المميزة، recency half-life (في SQL لا بالموديل)، نسبة 1–2★؛ و WTP كمضاعِف. حُذف "مصدرين+" (مستحيل قبل المرحلة 5) و"شريحة مستهدفة" (غير قابلة للقياس).
+3. **أدوات MCP لا تشغّل LLM داخل الـ server:** `run_gate`→`save_gate_result`، `generate_spec`→`save_spec`. Claude Code هو من يحكم ويكتب باستخدام `get_opportunity_evidence`. إضافة `list_clusters` و `search_reviews` عبر التطبيقات بفلتر `wtp_signal`. أي عمل LLM طويل في الـ web يُمرَّر عبر `enqueue()` ويعيد job id (نمط `actions.ts:62-66`).
+4. **Embeddings عند الحاجة: لا Voyage client جديد.** Voyage `/v1/embeddings` بصيغة OpenAI؛ نضيف `embed(cfg, texts, {inputType})` بجوار `chat()` في `ai.ts` + `settings.ai.embedding = {baseUrl, apiKey, model, dimensions}`. نخزّن `model` على `review_embeddings` (تغيير الموديل يُبطل كل المتجهات)، `dimensions: 1024` صريحة (text-embedding-3-small افتراضياً 1536). نُضمِّن `label + evidence` الإنجليزي المنظَّم لا النص الخام متعدد اللغات.
+5. **المصادقة: تبقى Cloudflare Access + MCP_TOKEN (+ Basic Auth).** التطبيق يتصل بدور `postgres` فـ RLS لا ينطبق أصلاً (0001 يفعّله فقط لحجب PostgREST). Supabase Auth يفرض client SDK على codebase لا تستورد `@lens/core` في الـ client. PIN خلف Access "مسرح".
+6. **`insights` per-app تبقى** كمسار رخيص؛ بعد المرحلة 2 نستبدل فقط نداء `CLUSTER_SYSTEM` (`analysis.ts:70-73,154-161`) بـ `group by` deterministic.
+
+### أخطاء في الـ brief الأصلي تم تصحيحها
+- **حيلة الدول المتعددة صحيحة لـ iOS فقط.** تقييمات Google Play غير مقيّدة بالدولة (`android.ts:112` id عالمي) → نفس التقييمات ×4 وتضخيم `n`/`distinct_apps`. الصور تُخزَّن `${appId}/screens/<hash>` (`sync.ts:136`) → 4 نسخ WebP متطابقة. الحل: العدّ بـ `(store, store_id)` لا `app_id`، ومنع multi-country للأندرويد (المهم هناك `lang`).
+- `cluster_members` بلا FK إلى `reviews` → orphans عند حذف تطبيق؛ يُضاف بـ cascade. عدّادات `clusters.n/distinct_apps/distinct_authors` عرضة للانجراف → view. `distinct_authors` بلا معنى عبر التطبيقات (nickname).
+- `killed_ideas.embedding` لعنوان مقارنة بـ centroids تقييمات = توزيعان نصيان مختلفان → خزّن centroid الـ cluster المقتول.
+- `items.unique(content_hash)` عالمياً يتصادم على نصوص قصيرة ("doesn't sync") → scope بالمصدر أو حذف.
+- العتبات 0.80/0.65/0.85 خاصة بالموديل → settings، وتُعاير على 200 عنصر موسومة قبل أي clustering.
+- pgvector مع postgres.js: لا OID لـ `vector` → مرّر `JSON.stringify(float[])` مع `::vector`؛ `create extension vector with schema extensions` على Supabase؛ `set local hnsw.ef_search` داخل `sql.begin` (transaction pooler يعطي backend مختلفاً لكل statement).
+- Jobs: `claimJob` يُسلسِل فقط الـ jobs التي تشترك في `payload.appId` (`jobs.ts:102-103`)، و `enqueue` يمنع التكرار للـ queued فقط (`jobs.ts:77`) → job عالمي قد يعمل مرتين بالتوازي ويتسابق على الـ centroid. الحل: job لكل تطبيق (`embed_app` بعد `analyse_app`) أو `pg_advisory_xact_lock`. لا job أحادي: timeout 15 دقيقة (`index.ts:210`) + `requeueStale(30)` سيقتله ويعيده.
+- Migrations تعمل عند بدء الـ worker في transaction واحدة → 0004+ DDL فقط، لا backfill.
+
+### المرحلة 1 — خطة diff دقيقة
+**مصيدتان:** (أ) إعادة التحليل لا تحدث وحدها: الـ worker يضع `analyse_app` فقط عند `newReviews > 0 || !getInsights` (`worker/index.ts:250`)، و `upsertReviews` يصفّر `analysed_at` فقط عند تغيّر النص (`sync.ts:339`) → عمود `analysis_version` + job `analyse_all`. (ب) حجم الإخراج: 40 تقييم × 5 حقول جديدة مع `evidence_span` حرفي يتجاوز `maxTokens: 6000` (`analysis.ts:64`) → batch 20 أو 12k.
+
+**الملفات:** `db/migrations/0004_review_signals.sql`؛ `packages/core/src/analysis.ts` (SYSTEM, `Classified`, `normaliseItem`, unnest update, pending query, batch 20)؛ `jobs.ts` (`JobType += "analyse_all"`)؛ `apps/worker/src/index.ts` (case جديد؛ شرط السطر 250 → pending count من `queries.ts:211`)؛ `queries.ts` (+فلتر `signal`، أعمدة جديدة)؛ `apps/mcp/src/tools.ts` `get_reviews`؛ `apps/web/app/actions.ts` `reanalyseAllAction` + زر في Settings؛ `index.ts` exports.
+
+```sql
+-- 0004_review_signals.sql (DDL فقط)
+alter table reviews
+  add column if not exists analysis_version smallint not null default 0,
+  add column if not exists pain_score smallint check (pain_score between 0 and 5),
+  add column if not exists wtp_signal text check (wtp_signal in ('paying_competitor','churned','workaround','stated_wtp','none')),
+  add column if not exists competitor_mentioned text,
+  add column if not exists workaround text,
+  add column if not exists evidence_span text,
+  add column if not exists raw_analysis jsonb;
+create index if not exists reviews_signal on reviews (wtp_signal) where wtp_signal <> 'none';
+```
+Pending query: `where analysed_at is null or analysis_version < ${ANALYSIS_VERSION}` (const = 2). `analyse_all` يضع `analyse_app` لكل تطبيق لديه صفوف معلّقة.
+
+**SYSTEM prompt:** لكل عنصر `id, sentiment, topic, kind, label, wtp_signal, competitor, workaround, evidence, pain`. القيود: `label` = `"<missing capability> — <context>"` ≤60 حرفاً، noun phrase إنجليزية، بلا أسماء تطبيقات؛ `competitor` فقط إن سُمّي تطبيق صراحة وإلا null؛ `workaround` ≤80 أو null؛ `evidence` substring حرفي من المدخل ≤200 أو null؛ `pain` 0–5. الـ normaliser يفرض الـ enums والقطع، ويرفض `evidence` غير موجود عبر `includes()` في النص الأصلي (يجعله null ويحتفظ بالصف)، ويخزّن العنصر الخام في `raw_analysis`.
+
+**الاختبارات:** `ai.test.ts` — fallbacks للـ enums، التحقق من substring الـ evidence، قطع الـ label، `competitor` → null إن لم يكن string. `integration.test.ts:293` — mock provider يعيد الحقول الجديدة → الأعمدة و `raw_analysis` مكتوبة، `analysis_version` مرفوع، `analyse_all` يضع job واحداً لكل تطبيق به صفوف معلّقة ولا شيء عند عدم وجودها.
